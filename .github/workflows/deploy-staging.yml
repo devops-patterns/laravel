@@ -1,0 +1,96 @@
+name: deploy-staging
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Determine image SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to staging
+        uses: appleboy/ssh-action@v1
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_ENV: ${{ vars.APP_ENV }}
+          APP_DEBUG: ${{ vars.APP_DEBUG }}
+          APP_URL: ${{ vars.APP_URL }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          IMAGE_TAG: sha-${{ steps.sha.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ vars.STAGING_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_NAME,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL,IMAGE_TAG,GH_TOKEN
+          script: |
+            set -euo pipefail
+            cd /opt/stacks/laravel
+
+            echo "$GH_TOKEN" | docker login ghcr.io -u github-actions --password-stdin
+
+            IMAGE="ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
+            echo "Deploying: $IMAGE"
+            docker pull "$IMAGE"
+
+            if docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
+              # --- Existing stack: graceful update ---
+              docker service scale laravel_worker=0 laravel_scheduler=0
+
+              docker service update --with-registry-auth --image "$IMAGE" laravel_app
+              docker service update --with-registry-auth --image "$IMAGE" laravel_worker
+              docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
+            else
+              # --- First deploy: create secrets + stack ---
+              printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
+              printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
+              printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
+
+              export IMAGE_TAG APP_NAME APP_ENV APP_DEBUG APP_URL LOG_LEVEL
+              docker stack deploy -c docker-compose.yml --with-registry-auth laravel
+            fi
+
+            echo "Waiting for laravel_app..."
+            for i in $(seq 1 30); do
+              CID=$(docker ps -qf name=laravel_app.1 | head -n1)
+              if [ -n "$CID" ] && docker exec "$CID" php artisan --version > /dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            CID=$(docker ps -qf name=laravel_app.1 | head -n1)
+            if [ -z "$CID" ]; then
+              echo "ERROR: laravel_app.1 not found after 60s" >&2
+              exit 1
+            fi
+
+            docker exec "$CID" php artisan migrate --force
+            docker exec "$CID" php artisan cache:clear
+
+            docker service scale laravel_worker=1 laravel_scheduler=1
+
+            echo "Staging deploy complete"

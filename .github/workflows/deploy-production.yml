@@ -1,0 +1,116 @@
+name: deploy-production
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to deploy (e.g. v1.2.3)"
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           startsWith(github.event.workflow_run.head_branch, 'v')) }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: tag is empty" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_ENV: ${{ vars.APP_ENV }}
+          APP_DEBUG: ${{ vars.APP_DEBUG }}
+          APP_URL: ${{ vars.APP_URL }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          IMAGE_TAG: ${{ steps.tag.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ vars.PROD_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_NAME,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL,TAG,IMAGE_TAG,GH_TOKEN
+          script: |
+            set -euo pipefail
+            cd /opt/stacks/laravel
+
+            echo "$GH_TOKEN" | docker login ghcr.io -u github-actions --password-stdin
+
+            IMAGE="ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
+            echo "Deploying: $IMAGE"
+            docker pull "$IMAGE"
+
+            if docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
+              # --- Existing stack: backup + graceful update ---
+              echo "Running pre-deploy backup..."
+              /opt/backups/scripts/backup-laravel.sh "pre-deploy-${TAG}"
+
+              docker service scale laravel_worker=0 laravel_scheduler=0
+
+              docker service update --with-registry-auth --image "$IMAGE" laravel_app
+              docker service update --with-registry-auth --image "$IMAGE" laravel_worker
+              docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
+            else
+              # --- First deploy: create secrets + stack ---
+              printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
+              printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
+              printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
+
+              export IMAGE_TAG APP_NAME APP_ENV APP_DEBUG APP_URL LOG_LEVEL
+              docker stack deploy -c docker-compose.yml --with-registry-auth laravel
+            fi
+
+            echo "Waiting for laravel_app..."
+            for i in $(seq 1 30); do
+              CID=$(docker ps -qf name=laravel_app.1 | head -n1)
+              if [ -n "$CID" ] && docker exec "$CID" php artisan --version > /dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            CID=$(docker ps -qf name=laravel_app.1 | head -n1)
+            if [ -z "$CID" ]; then
+              echo "ERROR: laravel_app.1 not found after 60s" >&2
+              exit 1
+            fi
+
+            docker exec "$CID" php artisan migrate --force
+            docker exec "$CID" php artisan cache:clear
+
+            docker service scale laravel_worker=1 laravel_scheduler=1
+
+            echo "Production deploy complete: $TAG"
