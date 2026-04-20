@@ -82,6 +82,16 @@ class Team extends Model
     }
 
     /**
+     * Get all tasks for this team.
+     *
+     * @return HasMany<Task, $this>
+     */
+    public function tasks(): HasMany
+    {
+        return $this->hasMany(Task::class);
+    }
+
+    /**
      * Get the attributes that should be cast.
      *
      * @return array<string, string>

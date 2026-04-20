@@ -74,6 +74,8 @@ COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 COPY --from=build --chown=www-data:www-data /app /app
 
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
 ENV SERVER_NAME=:80
 
 EXPOSE 80

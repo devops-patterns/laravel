@@ -73,25 +73,37 @@ jobs:
             echo "Deploying: $IMAGE"
             docker pull "$IMAGE"
 
-            if docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
-              # --- Existing stack: backup + graceful update ---
-              echo "Running pre-deploy backup..."
-              /opt/backups/scripts/backup-laravel.sh "pre-deploy-${TAG}"
+            # Secrets — создаются при первом деплое, при повторных игнорируются
+            printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
+            printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
+            printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
 
-              docker service scale laravel_worker=0 laravel_scheduler=0
-
-              docker service update --with-registry-auth --image "$IMAGE" laravel_app
-              docker service update --with-registry-auth --image "$IMAGE" laravel_worker
-              docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
-            else
-              # --- First deploy: create secrets + stack ---
-              printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
-              printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
-              printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
-
+            # Первый деплой — создать стек
+            if ! docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
               export IMAGE_TAG APP_NAME APP_ENV APP_DEBUG APP_URL LOG_LEVEL
               docker stack deploy -c docker-compose.yml --with-registry-auth laravel
             fi
+
+            # Pre-deploy бэкап (пропускается при первом деплое — БД пустая)
+            if docker exec $(docker ps -qf name=laravel_db.1 | head -n1) pg_isready -q 2>/dev/null; then
+              echo "Running pre-deploy backup..."
+              /opt/backups/scripts/backup-laravel.sh "pre-deploy-${TAG}"
+            fi
+
+            # Остановить воркеры на время миграций
+            docker service scale laravel_worker=0 laravel_scheduler=0
+
+            # Обновить образ app (start-first: новый поднимается, проходит healthcheck, потом старый убивается)
+            docker service update \
+              --with-registry-auth \
+              --image "$IMAGE" \
+              --update-order start-first \
+              --health-cmd 'curl -f http://localhost/up || exit 1' \
+              --health-interval 3s \
+              --health-timeout 3s \
+              --health-retries 3 \
+              --health-start-period 5s \
+              laravel_app
 
             echo "Waiting for laravel_app..."
             for i in $(seq 1 30); do
@@ -111,6 +123,9 @@ jobs:
             docker exec "$CID" php artisan migrate --force
             docker exec "$CID" php artisan cache:clear
 
+            # Обновить образ воркеров и запустить
+            docker service update --with-registry-auth --image "$IMAGE" laravel_worker
+            docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
             docker service scale laravel_worker=1 laravel_scheduler=1
 
             echo "Production deploy complete: $TAG"

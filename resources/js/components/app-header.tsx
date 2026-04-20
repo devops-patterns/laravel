@@ -1,5 +1,5 @@
 import { Link, usePage } from '@inertiajs/react';
-import { BookOpen, Folder, LayoutGrid, Menu, Search } from 'lucide-react';
+import { BookOpen, Folder, LayoutGrid, ListTodo, Menu, Search, Server } from 'lucide-react';
 import AppLogo from '@/components/app-logo';
 import AppLogoIcon from '@/components/app-logo-icon';
 import { Breadcrumbs } from '@/components/breadcrumbs';
@@ -34,7 +34,9 @@ import { UserMenuContent } from '@/components/user-menu-content';
 import { useCurrentUrl } from '@/hooks/use-current-url';
 import { useInitials } from '@/hooks/use-initials';
 import { cn, toUrl } from '@/lib/utils';
+import { Badge } from '@/components/ui/badge';
 import { dashboard } from '@/routes';
+import { index as tasksIndex } from '@/routes/tasks';
 import type { BreadcrumbItem, NavItem } from '@/types';
 
 type Props = {
@@ -59,16 +61,22 @@ const activeItemStyles =
 
 export function AppHeader({ breadcrumbs = [] }: Props) {
     const page = usePage();
-    const { auth, currentTeam } = page.props;
+    const { auth, currentTeam, hostname } = page.props;
     const getInitials = useInitials();
     const { isCurrentUrl, whenCurrentUrl } = useCurrentUrl();
     const dashboardUrl = currentTeam ? dashboard(currentTeam.slug) : '/';
+    const tasksUrl = currentTeam ? tasksIndex.url(currentTeam.slug) : '/';
 
     const mainNavItems: NavItem[] = [
         {
             title: 'Dashboard',
             href: dashboardUrl,
             icon: LayoutGrid,
+        },
+        {
+            title: 'Tasks',
+            href: tasksUrl,
+            icon: ListTodo,
         },
     ];
 
@@ -180,6 +188,10 @@ export function AppHeader({ breadcrumbs = [] }: Props) {
                     </div>
 
                     <div className="ml-auto flex items-center space-x-2">
+                        <Badge variant="outline" className="hidden gap-1.5 font-mono text-xs lg:inline-flex">
+                            <Server className="size-3" />
+                            {hostname}
+                        </Badge>
                         <div className="relative flex items-center space-x-1">
                             <Button
                                 variant="ghost"
