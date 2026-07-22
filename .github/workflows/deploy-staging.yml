@@ -56,54 +56,108 @@ jobs:
             echo "Deploying: $IMAGE"
             docker pull "$IMAGE"
 
-            # Secrets — создаются при первом деплое, при повторных игнорируются
+            # Секреты — создаются при первом деплое, при повторных игнорируются
             printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
             printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
             printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
 
-            # Первый деплой — создать стек
+            # Первый деплой — развернуть стек целиком и выйти (миграции запустит
+            # сам контейнер, flag обслуживания не нужен)
             if ! docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
               export IMAGE_TAG APP_NAME APP_ENV APP_DEBUG APP_URL LOG_LEVEL
               docker stack deploy -c docker-compose.yml --with-registry-auth laravel
+              echo "Initial stack deploy complete"
+              exit 0
             fi
 
-            # Остановить воркеры на время миграций
+            # ── helpers ──────────────────────────────────────────────────
+            app_container() {
+              docker ps -qf name=laravel_app --filter status=running | head -n1
+            }
+
+            wait_service_running() {
+              # Ждём, пока у сервиса появится running-task с нужным образом.
+              local svc="$1" img="$2"
+              for i in $(seq 1 60); do
+                if docker service ps "$svc" \
+                    --filter desired-state=running \
+                    --format '{{.Image}} {{.CurrentState}}' \
+                    | grep -q "^${img} Running"; then
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "ERROR: $svc не перешёл в Running с $img за 120s" >&2
+              docker service ps "$svc" --no-trunc >&2
+              return 1
+            }
+
+            DOMAIN="${APP_URL#*://}"
+            DOMAIN="${DOMAIN%%/*}"
+
+            probe_up() {
+              # Проверяем /up через Traefik (localhost:443 + Host-header),
+              # -k на случай если сертификат ещё не выпущен.
+              curl -fsSL -k --max-time 3 \
+                -H "Host: ${DOMAIN}" \
+                -o /dev/null \
+                "https://localhost/up"
+            }
+
+            # ── 1. Останавливаем воркеры (grace 120s из compose) ─────────
+            echo "→ Stopping workers"
             docker service scale laravel_worker=0 laravel_scheduler=0
 
-            # Обновить образ app (start-first: новый поднимается, проходит healthcheck, потом старый убивается)
+            # ── 2. Режим обслуживания (флаг в Redis, виден всем репликам) ─
+            CID=$(app_container)
+            if [ -n "$CID" ]; then
+              echo "→ Enabling maintenance"
+              docker exec "$CID" php artisan down --render="errors::503" || true
+            fi
+
+            # ── 3. Rolling update app (start-first из compose) ───────────
+            echo "→ Updating app image"
             docker service update \
               --with-registry-auth \
               --image "$IMAGE" \
-              --update-order start-first \
-              --update-delay 5s \
-              --health-cmd 'curl -f http://localhost/up || exit 1' \
-              --health-interval 3s \
-              --health-timeout 3s \
-              --health-retries 3 \
-              --health-start-period 5s \
               laravel_app
 
-            echo "Waiting for laravel_app..."
+            wait_service_running laravel_app "$IMAGE"
+
+            # ── 4. Миграции на новой схеме ───────────────────────────────
+            CID=$(app_container)
+            if [ -z "$CID" ]; then
+              echo "ERROR: не найден работающий контейнер laravel_app" >&2
+              exit 1
+            fi
+            echo "→ Running migrations"
+            docker exec "$CID" php artisan migrate --force
+
+            # ── 5. Обновляем образы воркера/планировщика ─────────────────
+            echo "→ Updating worker/scheduler images"
+            docker service update --with-registry-auth --image "$IMAGE" laravel_worker
+            docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
+
+            # ── 6. Возвращаем воркеров ───────────────────────────────────
+            docker service scale laravel_worker=1 laravel_scheduler=1
+
+            # ── 7. Проверяем доступность /up через Traefik ───────────────
+            echo "→ Waiting for /up via Traefik"
             for i in $(seq 1 30); do
-              CID=$(docker ps -qf name=laravel_app.1 | head -n1)
-              if [ -n "$CID" ] && docker exec "$CID" php artisan --version > /dev/null 2>&1; then
+              if probe_up; then
+                echo "  /up ok"
                 break
               fi
               sleep 2
             done
 
-            CID=$(docker ps -qf name=laravel_app.1 | head -n1)
-            if [ -z "$CID" ]; then
-              echo "ERROR: laravel_app.1 not found after 60s" >&2
-              exit 1
-            fi
+            # ── 8. Снимаем режим обслуживания (флаг удаляется из Redis) ──
+            CID=$(app_container)
+            echo "→ Disabling maintenance"
+            docker exec "$CID" php artisan up
 
-            docker exec "$CID" php artisan migrate --force
+            # ── 9. Чистим кеш уже после `up`, чтобы не стереть флаг ──────
+            echo "→ Clearing cache"
             docker exec "$CID" php artisan cache:clear
 
-            # Обновить образ воркеров и запустить
-            docker service update --with-registry-auth --image "$IMAGE" laravel_worker
-            docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
-            docker service scale laravel_worker=1 laravel_scheduler=1
-
-            echo "Staging deploy complete"
+            echo "✓ Staging deploy complete"
