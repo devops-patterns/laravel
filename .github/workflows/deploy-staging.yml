@@ -18,6 +18,9 @@ jobs:
     environment: staging
 
     steps:
+      - name: Checkout (нужны deploy/docker-compose.yml и deploy/.env.base)
+        uses: actions/checkout@v4
+
       - name: Determine image SHA
         id: sha
         run: |
@@ -27,25 +30,39 @@ jobs:
             echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Deploy to staging
-        uses: appleboy/ssh-action@v1
-        env:
-          APP_KEY: ${{ secrets.APP_KEY }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
-          APP_NAME: ${{ vars.APP_NAME }}
-          APP_ENV: ${{ vars.APP_ENV }}
-          APP_DEBUG: ${{ vars.APP_DEBUG }}
-          APP_URL: ${{ vars.APP_URL }}
-          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
-          IMAGE_TAG: sha-${{ steps.sha.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Версионируемые артефакты доставляем на сервер каждым деплоем (single source
+      # of truth — git). scp-action сам создаёт целевой каталог.
+      - name: Ship compose and env base
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ vars.STAGING_HOST }}
           username: ${{ vars.DEPLOY_USER }}
           port: ${{ vars.SSH_PORT }}
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_NAME,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL,IMAGE_TAG,GH_TOKEN
+          source: |
+            deploy/docker-compose.yml
+            deploy/.env.base
+          target: /opt/stacks/laravel/
+          strip_components: 1
+
+      - name: Deploy to staging
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: sha-${{ steps.sha.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          APP_ENV: ${{ vars.APP_ENV }}
+          APP_DEBUG: ${{ vars.APP_DEBUG }}
+          APP_URL: ${{ vars.APP_URL }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+        with:
+          host: ${{ vars.STAGING_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG,GH_TOKEN,APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL
           script: |
             set -euo pipefail
             cd /opt/stacks/laravel
@@ -56,33 +73,56 @@ jobs:
             echo "Deploying: $IMAGE"
             docker pull "$IMAGE"
 
-            # Секреты — создаются при первом деплое, при повторных игнорируются
-            printf '%s' "$APP_KEY" | docker secret create laravel_app_key - 2>/dev/null || true
-            printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password - 2>/dev/null || true
-            printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password - 2>/dev/null || true
+            : "${APP_KEY:?APP_KEY пуст (GitHub secret)}"
+            : "${APP_URL:?APP_URL пуст (GitHub var)}"
 
-            # Первый деплой — развернуть стек целиком и выйти (миграции запустит
-            # сам контейнер, flag обслуживания не нужен)
-            if ! docker stack ls --format '{{.Name}}' | grep -q '^laravel$'; then
-              export IMAGE_TAG APP_NAME APP_ENV APP_DEBUG APP_URL LOG_LEVEL
-              docker stack deploy -c docker-compose.yml --with-registry-auth laravel
-              echo "Initial stack deploy complete"
-              exit 0
-            fi
+            # Финальный .env = статичная база + значения из GitHub vars/secrets.
+            # Это ЕДИНСТВЕННЫЙ источник конфига, монтируется в /app/.env.
+            umask 077
+            {
+              cat .env.base
+              echo
+              echo "APP_ENV=${APP_ENV}"
+              echo "APP_DEBUG=${APP_DEBUG}"
+              echo "APP_URL=${APP_URL}"
+              echo "APP_KEY=${APP_KEY}"
+              echo "LOG_LEVEL=${LOG_LEVEL}"
+              echo "DB_PASSWORD=${DB_PASSWORD}"
+              echo "REDIS_PASSWORD=${REDIS_PASSWORD}"
+            } > .env.assembled
+
+            # Версия конфига = хэш содержимого: тот же .env → тот же секрет
+            # (идемпотентно), изменил → новое имя → Swarm катит новый конфиг.
+            ENV_VERSION=$(sha256sum .env.assembled | cut -c1-12)
+
+            # .env-секрет версионирован. Пароли БД/redis — один раз (иммутабельны;
+            # смена пароля БД — ALTER USER, не пересоздание секрета).
+            docker secret inspect "laravel_env_${ENV_VERSION}" >/dev/null 2>&1 || \
+              docker secret create "laravel_env_${ENV_VERSION}" .env.assembled
+            docker secret inspect laravel_db_password >/dev/null 2>&1 || \
+              printf '%s' "$DB_PASSWORD" | docker secret create laravel_db_password -
+            docker secret inspect laravel_redis_password >/dev/null 2>&1 || \
+              printf '%s' "$REDIS_PASSWORD" | docker secret create laravel_redis_password -
+
+            rm -f .env.assembled
+
+            # Для compose (POSTGRES_DB/USER + healthcheck) — из .env.base.
+            DB_DATABASE=$(grep -E '^DB_DATABASE=' .env.base | head -n1 | cut -d= -f2-)
+            DB_USERNAME=$(grep -E '^DB_USERNAME=' .env.base | head -n1 | cut -d= -f2-)
+            : "${DB_DATABASE:?DB_DATABASE не задан в .env.base}"
+            : "${DB_USERNAME:?DB_USERNAME не задан в .env.base}"
+
+            # APP_DOMAIN для traefik-лейбла — из APP_URL (единый источник).
+            APP_DOMAIN="${APP_URL#*://}"; APP_DOMAIN="${APP_DOMAIN%%/*}"
+            export IMAGE_TAG ENV_VERSION APP_DOMAIN DB_DATABASE DB_USERNAME
 
             # ── helpers ──────────────────────────────────────────────────
-            app_container() {
-              docker ps -qf name=laravel_app --filter status=running | head -n1
-            }
-
+            app_container() { docker ps -qf name=laravel_app --filter status=running | head -n1; }
             wait_service_running() {
-              # Ждём, пока у сервиса появится running-task с нужным образом.
               local svc="$1" img="$2"
               for i in $(seq 1 60); do
-                if docker service ps "$svc" \
-                    --filter desired-state=running \
-                    --format '{{.Image}} {{.CurrentState}}' \
-                    | grep -q "^${img} Running"; then
+                if docker service ps "$svc" --filter desired-state=running \
+                    --format '{{.Image}} {{.CurrentState}}' | grep -q "^${img} Running"; then
                   return 0
                 fi
                 sleep 2
@@ -91,73 +131,52 @@ jobs:
               docker service ps "$svc" --no-trunc >&2
               return 1
             }
-
-            DOMAIN="${APP_URL#*://}"
-            DOMAIN="${DOMAIN%%/*}"
-
             probe_up() {
-              # Проверяем /up через Traefik (localhost:443 + Host-header),
-              # -k на случай если сертификат ещё не выпущен.
-              curl -fsSL -k --max-time 3 \
-                -H "Host: ${DOMAIN}" \
-                -o /dev/null \
-                "https://localhost/up"
+              curl -fsSL -k --max-time 3 -H "Host: ${APP_DOMAIN}" -o /dev/null "https://localhost/up"
             }
 
-            # ── 1. Останавливаем воркеры (grace 120s из compose) ─────────
-            echo "→ Stopping workers"
-            docker service scale laravel_worker=0 laravel_scheduler=0
+            STACK_EXISTS=0
+            docker stack ls --format '{{.Name}}' | grep -q '^laravel$' && STACK_EXISTS=1
 
-            # ── 2. Режим обслуживания (флаг в Redis, виден всем репликам) ─
-            CID=$(app_container)
-            if [ -n "$CID" ]; then
-              echo "→ Enabling maintenance"
-              docker exec "$CID" php artisan down --render="errors::503" || true
+            # Режим обслуживания ДО раската (флаг в Redis виден и новым таскам).
+            if [ "$STACK_EXISTS" = 1 ]; then
+              CID=$(app_container)
+              if [ -n "$CID" ]; then
+                echo "→ Enabling maintenance"
+                docker exec "$CID" php artisan down --render="errors::503" || true
+              fi
             fi
 
-            # ── 3. Rolling update app (start-first из compose) ───────────
-            echo "→ Updating app image"
-            docker service update \
-              --with-registry-auth \
-              --image "$IMAGE" \
-              laravel_app
+            # Полный раскат: новый образ + новая версия .env-секрета. Только
+            # stack deploy подхватывает смену секрета (service update — нет).
+            # start-first из compose даёт zero-downtime.
+            echo "→ docker stack deploy"
+            docker stack deploy -c docker-compose.yml --with-registry-auth laravel
 
+            echo "→ Waiting for laravel_app on new image"
             wait_service_running laravel_app "$IMAGE"
 
-            # ── 4. Миграции на новой схеме ───────────────────────────────
+            # Миграции на новой схеме, в новом контейнере (один раз, не в воркерах).
             CID=$(app_container)
-            if [ -z "$CID" ]; then
-              echo "ERROR: не найден работающий контейнер laravel_app" >&2
-              exit 1
-            fi
+            [ -n "$CID" ] || { echo "ERROR: нет работающего laravel_app" >&2; exit 1; }
             echo "→ Running migrations"
             docker exec "$CID" php artisan migrate --force
 
-            # ── 5. Обновляем образы воркера/планировщика ─────────────────
-            echo "→ Updating worker/scheduler images"
-            docker service update --with-registry-auth --image "$IMAGE" laravel_worker
-            docker service update --with-registry-auth --image "$IMAGE" laravel_scheduler
-
-            # ── 6. Возвращаем воркеров ───────────────────────────────────
-            docker service scale laravel_worker=1 laravel_scheduler=1
-
-            # ── 7. Проверяем доступность /up через Traefik ───────────────
             echo "→ Waiting for /up via Traefik"
-            for i in $(seq 1 30); do
-              if probe_up; then
-                echo "  /up ok"
-                break
-              fi
-              sleep 2
+            for i in $(seq 1 30); do probe_up && { echo "  /up ok"; break; }; sleep 2; done
+
+            # Снять обслуживание (если включали) и подчистить кеш ПОСЛЕ up.
+            CID=$(app_container)
+            if [ "$STACK_EXISTS" = 1 ]; then
+              echo "→ Disabling maintenance"
+              docker exec "$CID" php artisan up
+            fi
+            docker exec "$CID" php artisan cache:clear || true
+
+            # Уборка старых env-секретов (текущий пропускаем; used → rm падает).
+            docker secret ls --filter name=laravel_env_ --format '{{.Name}}' | while read -r s; do
+              [ "$s" = "laravel_env_${ENV_VERSION}" ] && continue
+              docker secret rm "$s" >/dev/null 2>&1 || true
             done
 
-            # ── 8. Снимаем режим обслуживания (флаг удаляется из Redis) ──
-            CID=$(app_container)
-            echo "→ Disabling maintenance"
-            docker exec "$CID" php artisan up
-
-            # ── 9. Чистим кеш уже после `up`, чтобы не стереть флаг ──────
-            echo "→ Clearing cache"
-            docker exec "$CID" php artisan cache:clear
-
-            echo "✓ Staging deploy complete"
+            echo "✓ Staging deploy complete (env ${ENV_VERSION}, image ${IMAGE})"

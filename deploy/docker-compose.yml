@@ -1,0 +1,176 @@
+# PRODUCTION/STAGING Swarm-стек. Деплоит CI проекта (docker stack deploy).
+# CI доставляет этот файл на сервер (scp) и катит стек; локалки он не касается.
+#
+# Все ${VAR} подставляются при `docker stack deploy` из окружения CI.
+# Обязательные: IMAGE_TAG, ENV_VERSION, APP_DOMAIN, DB_DATABASE, DB_USERNAME.
+#
+# Конфиг приложения приходит ОДНИМ Docker-секретом — целым .env, смонтированным
+# в /app/.env (WORKDIR образа FrankenPHP — /app). Не добавляй сюда `environment:`
+# для Laravel-переменных: phpdotenv не перетирает существующие OS env, строка в
+# `environment:` молча победит .env. Один источник — .env. Исключение —
+# CADDY_GLOBAL_OPTIONS: его читает FrankenPHP/Caddy из OS env, про .env он не знает.
+
+x-app-image: &app-image ghcr.io/devops-patterns/laravel:${IMAGE_TAG:?IMAGE_TAG is required}
+
+x-app-secrets: &app-secrets
+  - source: app_env
+    target: /app/.env
+    # uid/gid владельца /app в образе (www-data = 33, см. Dockerfile
+    # `COPY --chown=www-data:www-data`). Не совпадёт — Laravel не прочитает .env.
+    uid: "33"
+    gid: "33"
+    mode: 0400
+
+services:
+  app:
+    image: *app-image
+    environment:
+      # TLS терминируется на Traefik; не даём FrankenPHP лезть за своим HTTPS.
+      CADDY_GLOBAL_OPTIONS: "auto_https off"
+    secrets: *app-secrets
+    volumes:
+      - storage:/app/storage/app/public
+    networks:
+      - traefik-ingress
+      - internal
+    stop_grace_period: 5s
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 3s
+        order: start-first
+        failure_action: rollback
+        monitor: 10s
+      rollback_config:
+        parallelism: 1
+        delay: 3s
+        order: start-first
+        monitor: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=traefik-ingress"
+        # APP_DOMAIN обязан совпадать с domains[env] в gitops (stacks/laravel/vars.yml).
+        - "traefik.http.routers.laravel.rule=Host(`${APP_DOMAIN:?APP_DOMAIN is required}`)"
+        - "traefik.http.routers.laravel.entrypoints=websecure"
+        - "traefik.http.routers.laravel.tls=true"
+        - "traefik.http.routers.laravel.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.laravel.middlewares=laravel-retry"
+        - "traefik.http.middlewares.laravel-retry.retry.attempts=4"
+        - "traefik.http.middlewares.laravel-retry.retry.initialInterval=50ms"
+        - "traefik.http.services.laravel.loadbalancer.server.port=80"
+        # /up — без auth/CSRF/session/БД. Traefik дёргает раз в секунду.
+        - "traefik.http.services.laravel.loadbalancer.healthcheck.path=/up"
+        - "traefik.http.services.laravel.loadbalancer.healthcheck.interval=1s"
+        - "traefik.http.services.laravel.loadbalancer.healthcheck.timeout=500ms"
+
+  worker:
+    image: *app-image
+    command: php artisan queue:work --sleep=3 --tries=3 --max-time=3600
+    secrets: *app-secrets
+    volumes:
+      - storage:/app/storage/app/public
+    networks:
+      - internal
+    stop_grace_period: 120s
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        monitor: 10s
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  scheduler:
+    image: *app-image
+    command: php artisan schedule:work
+    secrets: *app-secrets
+    networks:
+      - internal
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 10s
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  # Имя сервиса ОБЯЗАНО быть `db`: бэкап gitops ищет контейнер `<stack>_db`.
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:?DB_DATABASE is required}
+      POSTGRES_USER: ${DB_USERNAME:?DB_USERNAME is required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - source: db_password
+        target: db_password
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    command: sh -c "redis-server --requirepass $$(cat /run/secrets/redis_password)"
+    secrets:
+      - source: redis_password
+        target: redis_password
+    volumes:
+      - redis:/data
+    networks:
+      - internal
+    deploy:
+      restart_policy:
+        condition: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$(cat /run/secrets/redis_password) ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  # Создаётся gitops (roles/docker). Стек обязан в неё входить, иначе Traefik его не увидит.
+  traefik-ingress:
+    external: true
+  internal:
+    driver: overlay
+
+secrets:
+  # Весь .env одним секретом, имя версионируется по git-sha: новый sha → новое имя
+  # → Swarm катит таски с новым конфигом.
+  app_env:
+    external: true
+    name: laravel_env_${ENV_VERSION:?ENV_VERSION is required}
+  db_password:
+    external: true
+    name: laravel_db_password
+  redis_password:
+    external: true
+    name: laravel_redis_password
+
+volumes:
+  dbdata:
+  redis:
+  storage:
