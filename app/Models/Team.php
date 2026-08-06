@@ -92,6 +92,16 @@ class Team extends Model
     }
 
     /**
+     * Get all gallery images for this team.
+     *
+     * @return HasMany<GalleryImage, $this>
+     */
+    public function galleryImages(): HasMany
+    {
+        return $this->hasMany(GalleryImage::class);
+    }
+
+    /**
      * Get the attributes that should be cast.
      *
      * @return array<string, string>

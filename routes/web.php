@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\GalleryController;
 use App\Http\Controllers\TaskController;
 use App\Http\Controllers\Teams\TeamInvitationController;
 use App\Http\Middleware\EnsureTeamMembership;
@@ -19,6 +20,11 @@ Route::prefix('{current_team}')
         Route::post('tasks', [TaskController::class, 'store'])->name('tasks.store');
         Route::post('tasks/batch', [TaskController::class, 'storeBatch'])->name('tasks.store-batch');
         Route::delete('tasks/{task}', [TaskController::class, 'destroy'])->name('tasks.destroy');
+
+        Route::get('gallery', [GalleryController::class, 'index'])->name('gallery.index');
+        Route::post('gallery', [GalleryController::class, 'store'])->name('gallery.store');
+        Route::post('gallery/generate', [GalleryController::class, 'generate'])->name('gallery.generate');
+        Route::delete('gallery/{image}', [GalleryController::class, 'destroy'])->name('gallery.destroy');
     });
 
 Route::middleware(['auth'])->group(function () {

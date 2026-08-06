@@ -1,5 +1,11 @@
 import { Link, usePage } from '@inertiajs/react';
-import { BookOpen, FolderGit2, LayoutGrid, ListTodo } from 'lucide-react';
+import {
+    BookOpen,
+    FolderGit2,
+    Images,
+    LayoutGrid,
+    ListTodo,
+} from 'lucide-react';
 import AppLogo from '@/components/app-logo';
 import { NavFooter } from '@/components/nav-footer';
 import { NavMain } from '@/components/nav-main';
@@ -15,6 +21,7 @@ import {
     SidebarMenuItem,
 } from '@/components/ui/sidebar';
 import { dashboard } from '@/routes';
+import { index as galleryIndex } from '@/routes/gallery';
 import { index as tasksIndex } from '@/routes/tasks';
 import type { NavItem } from '@/types';
 
@@ -25,6 +32,9 @@ export function AppSidebar() {
         : '/';
     const tasksUrl = page.props.currentTeam
         ? tasksIndex.url(page.props.currentTeam.slug)
+        : '/';
+    const galleryUrl = page.props.currentTeam
+        ? galleryIndex.url(page.props.currentTeam.slug)
         : '/';
 
     const mainNavItems: NavItem[] = [
@@ -37,6 +47,11 @@ export function AppSidebar() {
             title: 'Tasks',
             href: tasksUrl,
             icon: ListTodo,
+        },
+        {
+            title: 'Gallery',
+            href: galleryUrl,
+            icon: Images,
         },
     ];
 
