@@ -116,7 +116,10 @@ services:
       - source: db_password
         target: db_password
     volumes:
-      - dbdata:/var/lib/postgresql/data
+      # PG18: том монтируем на РОДИТЕЛЯ /var/lib/postgresql (PGDATA внутри —
+      # /var/lib/postgresql/18/docker). Старый путь …/data образ PG18 считает
+      # "unused mount/volume" и падает с exit 1 (см. docker-library/postgres#37).
+      - dbdata:/var/lib/postgresql
     networks:
       - internal
     deploy:
