@@ -135,17 +135,20 @@ jobs:
             app_container() { docker ps -qf name=laravel_app --filter status=running | head -n1; }
             db_container()  { docker ps -qf name=laravel_db  --filter status=running | head -n1; }
             wait_db_ready() {
-              # На первом деплое postgres ещё тянется/инициализируется; пока таск db
-              # не в Running, его имя не зарегистрировано в DNS overlay-сети и app не
-              # резолвит "db". Ждём, пока БД реально примет подключения.
+              # Пробиваем db:5432 ИЗ КОНТЕЙНЕРА APP — ровно оттуда, откуда идут
+              # миграции. pg_isready внутри db-контейнера сказал бы лишь, что postgres
+              # поднялся локально, но не что app уже резолвит имя "db" в overlay-сети:
+              # на свежем стеке DNS-регистрация имени отстаёт на пару секунд. fsockopen
+              # проверяет и резолв имени, и доступность TCP-порта разом.
+              local cid; cid=$(app_container)
+              [ -n "$cid" ] || { echo "ERROR: нет работающего laravel_app" >&2; return 1; }
               for i in $(seq 1 90); do
-                local cid; cid=$(db_container)
-                if [ -n "$cid" ] && docker exec "$cid" pg_isready -q 2>/dev/null; then
+                if docker exec "$cid" php -r 'exit(@fsockopen("db",5432,$e,$s,2)?0:1);' 2>/dev/null; then
                   return 0
                 fi
                 sleep 2
               done
-              echo "ERROR: laravel_db не принял подключения за 180s" >&2
+              echo "ERROR: app не смог подключиться к db:5432 за 180s" >&2
               docker service ps laravel_db --no-trunc >&2
               return 1
             }
