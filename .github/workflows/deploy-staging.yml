@@ -39,9 +39,7 @@ jobs:
           username: ${{ vars.DEPLOY_USER }}
           port: ${{ vars.SSH_PORT }}
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          source: |
-            deploy/docker-compose.yml
-            deploy/.env.base
+          source: "deploy/docker-compose.yml,deploy/.env.base"
           target: /opt/stacks/laravel/
           strip_components: 1
 
