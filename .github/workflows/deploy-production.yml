@@ -134,6 +134,21 @@ jobs:
             # ── helpers ──────────────────────────────────────────────────
             app_container() { docker ps -qf name=laravel_app --filter status=running | head -n1; }
             db_container()  { docker ps -qf name=laravel_db  --filter status=running | head -n1; }
+            wait_db_ready() {
+              # На первом деплое postgres ещё тянется/инициализируется; пока таск db
+              # не в Running, его имя не зарегистрировано в DNS overlay-сети и app не
+              # резолвит "db". Ждём, пока БД реально примет подключения.
+              for i in $(seq 1 90); do
+                local cid; cid=$(db_container)
+                if [ -n "$cid" ] && docker exec "$cid" pg_isready -q 2>/dev/null; then
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "ERROR: laravel_db не принял подключения за 180s" >&2
+              docker service ps laravel_db --no-trunc >&2
+              return 1
+            }
             wait_service_running() {
               local svc="$1" img="$2"
               for i in $(seq 1 60); do
@@ -182,6 +197,9 @@ jobs:
 
             echo "→ Waiting for laravel_app on new image"
             wait_service_running laravel_app "$IMAGE"
+
+            echo "→ Waiting for laravel_db to accept connections"
+            wait_db_ready
 
             # Миграции на новой схеме, в новом контейнере (один раз, не в воркерах).
             CID=$(app_container)
