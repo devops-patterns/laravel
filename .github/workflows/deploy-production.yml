@@ -176,7 +176,7 @@ jobs:
             DB_CID=$(db_container)
             if [ -n "$DB_CID" ] && docker exec "$DB_CID" pg_isready -q 2>/dev/null; then
               echo "→ Running pre-deploy backup"
-              sudo -n /opt/backups/bin/run-backup.sh laravel \
+              sudo -n /opt/backups/bin/run-backup.sh laravel predeploy \
                 || echo "WARNING: pre-deploy бэкап не выполнен (нет sudo/скрипта) — продолжаю"
             fi
 
