@@ -5,7 +5,7 @@
 как ручной фолбэк на сервере.
 
 ## Файлы
-- `docker-compose.yml` — Swarm-стек (`app/worker/scheduler/db/redis`), traefik-лейблы, сеть
+- `docker-compose.yml` — Swarm-стек (`app/queue/scheduler/db/redis`), traefik-лейблы, сеть
   `traefik-ingress`. Именами соблюдает контракт gitops (стек `laravel`, сервис `db` →
   `laravel_db`, том `storage` → `laravel_storage`). CI доставляет его на сервер (scp) каждым
   деплоем — версионируется в git.
@@ -71,7 +71,7 @@ CI на сервере собирает финальный `.env` = `.env.base` 
 2. В GitHub задать Environments (secrets/vars выше).
 3. Push в `master` → `build.yml` соберёт образ → `deploy-staging.yml` раскатит стек.
 4. Проверка: `https://laravel-staging.doma1n.ru/up` → 200; на сервере `docker service ls`
-   (`laravel_app/worker/scheduler/db/redis` Running), `docker secret ls`
+   (`laravel_app/queue/scheduler/db/redis` Running), `docker secret ls`
    (`laravel_env_<hash>`, `laravel_db_password`, `laravel_redis_password`),
    `docker volume inspect laravel_storage`.
 

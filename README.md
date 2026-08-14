@@ -10,7 +10,7 @@
 - **Cache/Session/Queue**: Redis (сервис `redis`)
 - **Health endpoint**: `GET /up` (Laravel 13 из коробки, `bootstrap/app.php`)
 
-Один и тот же образ запускается как `app`, `worker` и `scheduler` — последние два переопределяют CMD через gitops compose.
+Один и тот же образ запускается как `app`, `queue` и `scheduler` — последние два переопределяют CMD через gitops compose.
 
 ### Секреты
 
@@ -30,15 +30,15 @@
 **Первый деплой** (стека нет):
 1. Логин в GHCR через `GITHUB_TOKEN`.
 2. Создание Docker Swarm secrets из GitHub secrets (идемпотентно).
-3. `docker stack deploy` — поднимает весь стек (app, worker, scheduler, db, redis).
+3. `docker stack deploy` — поднимает весь стек (app, queue, scheduler, db, redis).
 4. Ожидание готовности app → миграции.
 
 **Обновление** (стек уже существует):
 1. Логин в GHCR.
-2. Graceful stop worker/scheduler (`scale 0`).
-3. `docker service update --image` для app, worker, scheduler (worker/scheduler при scale=0 не запускаются).
+2. Graceful stop queue/scheduler (`scale 0`).
+3. `docker service update --image` для app, queue, scheduler (queue/scheduler при scale=0 не запускаются).
 4. Ожидание готовности app → миграции + `cache:clear`.
-5. `scale 1` для worker/scheduler — стартуют с новым образом после миграций.
+5. `scale 1` для queue/scheduler — стартуют с новым образом после миграций.
 6. (только prod) Pre-deploy бэкап перед шагом 2.
 
 Stack deploy используется **только при первом деплое**. Последующие обновления через `service update --image` — это позволяет не давать воркерам стартовать до завершения миграций.

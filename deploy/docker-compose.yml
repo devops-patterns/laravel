@@ -68,7 +68,7 @@ services:
         - "traefik.http.services.laravel.loadbalancer.healthcheck.interval=1s"
         - "traefik.http.services.laravel.loadbalancer.healthcheck.timeout=500ms"
 
-  worker:
+  queue:
     image: *app-image
     command: php artisan queue:work --sleep=3 --tries=3 --max-time=3600
     secrets: *app-secrets

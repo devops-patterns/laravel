@@ -199,3 +199,17 @@ jobs:
             done
 
             echo "✓ Staging deploy complete (env ${ENV_VERSION}, image ${IMAGE})"
+
+      # Staging повторяет прод: тянем последний прод-бэкап и восстанавливаем БД +
+      # медиа (скрипт gitops уже на хосте, крутится под root → sudo). Каждый деплой
+      # перетирает staging-данные боевыми — это и есть цель staging.
+      - name: Seed staging from latest production backup
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.STAGING_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            sudo /opt/backups/bin/restore-latest.sh laravel
