@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout (нужны deploy/docker-compose.yml и deploy/.env.base)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Версионируемые артефакты доставляем на сервер каждым деплоем (single source
       # of truth — git). scp-action сам создаёт целевой каталог.
