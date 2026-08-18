@@ -5,8 +5,10 @@ name: linter
 on:
   workflow_call:
 
+# contents: read — авто-коммит правок стиля отключён (шаг ниже закомментирован);
+# как reusable-workflow нельзя просить прав больше, чем выдаёт caller (ci.yml).
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   quality:
