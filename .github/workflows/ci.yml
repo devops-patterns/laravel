@@ -1,0 +1,119 @@
+name: ci
+
+# Единая точка входа. Все реальные триггеры — здесь; листовые workflow'ы
+# (lint/tests/build/deploy-*) переведены в workflow_call и вызываются как jobs.
+# Один прогон = одна цепочка, из веб-морды запускается одной кнопкой (Run workflow).
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Что сделать (checks — только проверки)"
+        type: choice
+        options: [checks, staging, production]
+        default: checks
+      ref:
+        description: "Только для target=production: версия существующего образа (напр. v1.2.3)"
+        type: string
+        required: false
+
+concurrency:
+  # PR-прогоны отменяем при новом пуше; деплой-прогоны (push/tag/dispatch) — нет.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── Проверки (всегда: PR, push, dispatch) ────────────────────────────────
+  lint:
+    uses: ./.github/workflows/lint.yml
+    secrets: inherit
+
+  test:
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+
+  # Готовит теги для production: на теге v* — из git-ref, при откате — из ref.
+  # Отдельным job, чтобы работать и когда build пропущен (откат существующего образа).
+  prepare:
+    runs-on: self-hosted
+    outputs:
+      prod_image_tag: ${{ steps.p.outputs.prod_image_tag }}
+      prod_release_tag: ${{ steps.p.outputs.prod_release_tag }}
+    steps:
+      - id: p
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+          REF_INPUT: ${{ inputs.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "production" ]; then
+            REL="$REF_INPUT"
+            if [ -z "$REL" ]; then
+              echo "ERROR: для target=production нужен ref (версия существующего образа, напр. v1.2.3)" >&2
+              exit 1
+            fi
+          elif [ "$REF_TYPE" = "tag" ]; then
+            REL="$REF_NAME"
+          else
+            REL=""
+          fi
+          echo "prod_release_tag=$REL" >> "$GITHUB_OUTPUT"
+          echo "prod_image_tag=${REL#v}" >> "$GITHUB_OUTPUT"
+
+  # ── Сборка образа ────────────────────────────────────────────────────────
+  # Только после зелёных проверок. Пропускается на PR, на dispatch=checks и на
+  # dispatch=production (откат катит уже собранный образ — пересборка не нужна).
+  build:
+    needs: [lint, test]
+    if: >-
+      ${{ github.event_name != 'pull_request'
+          && !(github.event_name == 'workflow_dispatch' && inputs.target == 'checks')
+          && !(github.event_name == 'workflow_dispatch' && inputs.target == 'production') }}
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  # ── Деплой staging ───────────────────────────────────────────────────────
+  # push в master или ручной dispatch target=staging. Катит свежесобранный sha-образ.
+  deploy-staging:
+    needs: [build]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success'
+          && ( (github.event_name == 'push' && github.ref == 'refs/heads/master')
+               || (github.event_name == 'workflow_dispatch' && inputs.target == 'staging') ) }}
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    uses: ./.github/workflows/deploy-staging.yml
+    with:
+      image_tag: ${{ needs.build.outputs.sha_tag }}
+    secrets: inherit
+
+  # ── Деплой production ────────────────────────────────────────────────────
+  # тег v* (build → deploy) ИЛИ dispatch target=production+ref (откат/раскат
+  # существующего образа, build пропущен). Апрув — через environment: production
+  # в самом deploy-production.yml. build.result != 'failure' пропускает skipped(откат).
+  deploy-production:
+    needs: [prepare, build]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.build.result != 'failure'
+          && ( (github.event_name == 'push' && github.ref_type == 'tag')
+               || (github.event_name == 'workflow_dispatch' && inputs.target == 'production') ) }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    uses: ./.github/workflows/deploy-production.yml
+    with:
+      image_tag: ${{ needs.prepare.outputs.prod_image_tag }}
+      release_tag: ${{ needs.prepare.outputs.prod_release_tag }}
+    secrets: inherit

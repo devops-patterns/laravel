@@ -1,50 +1,30 @@
 name: deploy-production
 
+# Reusable-компонент: вызывается оркестратором ci.yml (workflow_call).
+# release_tag (напр. v1.2.3) и image_tag (semver <version>) приходят входами:
+# на теге v* их считает build/ci, при откате dispatch — из введённого ref.
 on:
-  workflow_run:
-    workflows: [build]
-    types: [completed]
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      tag:
-        description: "Git tag to deploy (e.g. v1.2.3)"
+      image_tag:
+        description: "Semver-тег образа для раската (напр. 1.2.3)."
+        required: true
+        type: string
+      release_tag:
+        description: "Релизный тег для логов (напр. v1.2.3)."
         required: true
         type: string
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
+# Сериализацию деплоев держит оркестратор (concurrency на caller-job в ci.yml) —
+# одноимённая группа и здесь, и там попала бы в один namespace и дала дедлок.
 jobs:
   deploy:
-    if: >-
-      ${{ github.event_name == 'workflow_dispatch' ||
-          (github.event.workflow_run.conclusion == 'success' &&
-           startsWith(github.event.workflow_run.head_branch, 'v')) }}
     runs-on: self-hosted
     environment: production
 
     steps:
       - name: Checkout (нужны deploy/docker-compose.yml и deploy/.env.base)
         uses: actions/checkout@v4
-
-      - name: Determine release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${{ github.event.workflow_run.head_branch }}"
-          fi
-
-          if [ -z "$TAG" ]; then
-            echo "ERROR: tag is empty" >&2
-            exit 1
-          fi
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
 
       # Версионируемые артефакты доставляем на сервер каждым деплоем (single source
       # of truth — git). scp-action сам создаёт целевой каталог.
@@ -62,8 +42,8 @@ jobs:
       - name: Deploy to production
         uses: appleboy/ssh-action@v1
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          IMAGE_TAG: ${{ steps.tag.outputs.version }}
+          TAG: ${{ inputs.release_tag }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_KEY: ${{ secrets.APP_KEY }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}

@@ -1,12 +1,16 @@
 name: build
 
+# Reusable-компонент: вызывается только оркестратором ci.yml (workflow_call).
+# Отдаёт теги собранного образа, чтобы deploy-jobs знали, что тянуть, — без workflow_run.
 on:
-  push:
-    branches:
-      - master
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  workflow_call:
+    outputs:
+      sha_tag:
+        description: "Полный тег образа по git-sha (sha-<sha>) — для staging."
+        value: ${{ jobs.build-push.outputs.sha_tag }}
+      version_tag:
+        description: "Semver-тег образа (<version>) для тегов v*, иначе пусто — для production."
+        value: ${{ jobs.build-push.outputs.version_tag }}
 
 concurrency:
   group: build-${{ github.ref }}
@@ -22,6 +26,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      sha_tag: ${{ steps.tags.outputs.sha_tag }}
+      version_tag: ${{ steps.tags.outputs.version_tag }}
 
     steps:
       - name: Checkout
@@ -64,3 +71,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+      # Теги образа для оркестратора: sha_tag тянет staging, version_tag (<version>
+      # без 'v') — production. Совпадают со схемой docker/metadata-action выше.
+      - name: Expose image tags
+        id: tags
+        run: |
+          echo "sha_tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version_tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_tag=" >> "$GITHUB_OUTPUT"
+          fi

@@ -1,34 +1,25 @@
 name: deploy-staging
 
+# Reusable-компонент: вызывается оркестратором ci.yml (workflow_call).
+# Тег образа приходит входом image_tag (build.outputs.sha_tag) — без workflow_run.
 on:
-  workflow_run:
-    workflows: [build]
-    types: [completed]
-    branches: [master]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "Тег образа для раската (напр. sha-<sha>)."
+        required: true
+        type: string
 
-concurrency:
-  group: deploy-staging
-  cancel-in-progress: false
-
+# Сериализацию деплоев держит оркестратор (concurrency на caller-job в ci.yml) —
+# одноимённая группа и здесь, и там попала бы в один namespace и дала дедлок.
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: self-hosted
     environment: staging
 
     steps:
       - name: Checkout (нужны deploy/docker-compose.yml и deploy/.env.base)
         uses: actions/checkout@v4
-
-      - name: Determine image SHA
-        id: sha
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
 
       # Версионируемые артефакты доставляем на сервер каждым деплоем (single source
       # of truth — git). scp-action сам создаёт целевой каталог.
@@ -46,7 +37,7 @@ jobs:
       - name: Deploy to staging
         uses: appleboy/ssh-action@v1
         env:
-          IMAGE_TAG: sha-${{ steps.sha.outputs.sha }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_KEY: ${{ secrets.APP_KEY }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}

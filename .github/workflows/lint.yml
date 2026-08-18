@@ -1,18 +1,9 @@
 name: linter
 
+# Reusable-компонент: вызывается только оркестратором ci.yml (workflow_call).
+# Прямых триггеров нет — все триггеры на ci.yml, чтобы не было двойных прогонов.
 on:
-  push:
-    branches:
-      - develop
-      - main
-      - master
-      - workos
-  pull_request:
-    branches:
-      - develop
-      - main
-      - master
-      - workos
+  workflow_call:
 
 permissions:
   contents: write
