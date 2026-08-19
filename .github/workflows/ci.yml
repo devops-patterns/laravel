@@ -47,6 +47,7 @@ jobs:
     outputs:
       prod_image_tag: ${{ steps.p.outputs.prod_image_tag }}
       prod_release_tag: ${{ steps.p.outputs.prod_release_tag }}
+      rollback_to: ${{ steps.p.outputs.rollback_to }}
     steps:
       - id: p
         env:
@@ -70,6 +71,13 @@ jobs:
           fi
           echo "prod_release_tag=$REL" >> "$GITHUB_OUTPUT"
           echo "prod_image_tag=${REL#v}" >> "$GITHUB_OUTPUT"
+          # Откат = ручной dispatch на prod: восстановить БД под целевую версию.
+          # Обычный тег v* — пусто, БД не трогаем.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "production" ]; then
+            echo "rollback_to=$REL" >> "$GITHUB_OUTPUT"
+          else
+            echo "rollback_to=" >> "$GITHUB_OUTPUT"
+          fi
 
   # ── Сборка образа ────────────────────────────────────────────────────────
   # Только после зелёных проверок. Пропускается на PR, на dispatch=checks и на
@@ -116,4 +124,5 @@ jobs:
     with:
       image_tag: ${{ needs.prepare.outputs.prod_image_tag }}
       release_tag: ${{ needs.prepare.outputs.prod_release_tag }}
+      rollback_to: ${{ needs.prepare.outputs.rollback_to }}
     secrets: inherit

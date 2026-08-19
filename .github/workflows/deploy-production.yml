@@ -14,6 +14,11 @@ on:
         description: "Релизный тег для логов (напр. v1.2.3)."
         required: true
         type: string
+      rollback_to:
+        description: "Непусто = откат: восстановить БД из точки отката этой версии (напр. v1.2.3)."
+        required: false
+        type: string
+        default: ''
 
 # Сериализацию деплоев держит оркестратор (concurrency на caller-job в ci.yml) —
 # одноимённая группа и здесь, и там попала бы в один namespace и дала дедлок.
@@ -149,14 +154,17 @@ jobs:
               curl -fsSL -k --max-time 3 -H "Host: ${APP_DOMAIN}" -o /dev/null "https://localhost/up"
             }
 
-            # ── Pre-deploy бэкап БД (best-effort) ────────────────────────
-            # Скрипт gitops /opt/backups/bin/run-backup.sh <project> крутится под
-            # root (docker + borg-ключ в /root/.ssh) → нужен sudo. Релиз не
-            # блокируем: cron borgmatic и так снимает по расписанию.
+            # ── Pre-deploy бэкап БД = точка отката (best-effort) ─────────
+            # Помечаем снапшот УХОДЯЩЕЙ версией (тег работающего laravel_app) — при
+            # откате на неё restore найдёт ровно этот архив. Скрипт gitops крутится
+            # под root → sudo. Релиз не блокируем: cron borgmatic снимает по расписанию.
             DB_CID=$(db_container)
             if [ -n "$DB_CID" ] && docker exec "$DB_CID" pg_isready -q 2>/dev/null; then
-              echo "→ Running pre-deploy backup"
-              sudo -n /opt/backups/bin/run-backup.sh laravel predeploy \
+              CUR_IMG=$(docker service inspect laravel_app \
+                --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || true)
+              CUR_IMG=${CUR_IMG%@*}; CUR_VER=${CUR_IMG##*:}
+              echo "→ Running pre-deploy backup (точка отката для v${CUR_VER})"
+              sudo -n /opt/backups/bin/run-backup.sh laravel rollback "v${CUR_VER}" \
                 || echo "WARNING: pre-deploy бэкап не выполнен (нет sudo/скрипта) — продолжаю"
             fi
 
@@ -208,3 +216,22 @@ jobs:
             done
 
             echo "✓ Production deploy complete: $TAG (env ${ENV_VERSION}, image ${IMAGE})"
+
+      # Откат: восстановить БД из точки отката целевой версии (rollback_to задан только
+      # при ручном dispatch target=production — обычный деплой по тегу v* БД не трогает).
+      # Скрипт сам гасит app/queue/scheduler, чинит БД+медиа, возвращает реплики, мигрирует.
+      - name: Restore database for rollback
+        if: ${{ inputs.rollback_to != '' }}
+        uses: appleboy/ssh-action@v1
+        env:
+          ROLLBACK_TO: ${{ inputs.rollback_to }}
+        with:
+          host: ${{ vars.PROD_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: ROLLBACK_TO
+          script: |
+            set -euo pipefail
+            echo "→ Восстановление БД под откат на ${ROLLBACK_TO}"
+            sudo /opt/backups/bin/restore-latest.sh laravel "$ROLLBACK_TO"
