@@ -94,6 +94,12 @@ export function AppSidebar() {
             <SidebarFooter>
                 <NavFooter items={footerNavItems} className="mt-auto" />
                 <NavUser />
+                <div
+                    className="truncate px-2 text-xs text-neutral-500 group-data-[collapsible=icon]:hidden dark:text-neutral-400"
+                    title={page.props.version}
+                >
+                    Version: {page.props.version}
+                </div>
             </SidebarFooter>
         </Sidebar>
     );
