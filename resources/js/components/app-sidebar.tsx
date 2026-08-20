@@ -27,6 +27,13 @@ import type { NavItem } from '@/types';
 
 export function AppSidebar() {
     const page = usePage();
+    // Релиз по тегу — semver (v1.2.3) показываем как есть; иначе это commit sha
+    // (возможно с суффиксом -dirty, или 'dev') — режем sha до короткого,
+    // суффикс сохраняем.
+    const version = page.props.version;
+    const displayVersion = /^v?\d+\.\d+\.\d+/.test(version)
+        ? version
+        : version.replace(/^[0-9a-f]{7,40}/i, (sha) => sha.slice(0, 7));
     const dashboardUrl = page.props.currentTeam
         ? dashboard(page.props.currentTeam.slug)
         : '/';
@@ -96,9 +103,9 @@ export function AppSidebar() {
                 <NavUser />
                 <div
                     className="truncate px-2 text-xs text-neutral-500 group-data-[collapsible=icon]:hidden dark:text-neutral-400"
-                    title={page.props.version}
+                    title={version}
                 >
-                    Version: {page.props.version}
+                    Version: {displayVersion}
                 </div>
             </SidebarFooter>
         </Sidebar>

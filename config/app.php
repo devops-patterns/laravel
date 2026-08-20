@@ -1,5 +1,7 @@
 <?php
 
+use App\Support\Version;
+
 return [
 
     /*
@@ -15,7 +17,7 @@ return [
 
     'name' => env('APP_NAME', 'Laravel'),
 
-    'version' => env('APP_VERSION', 'dev'),
+    'version' => env('APP_VERSION') ?: Version::gitSha(),
 
     /*
     |--------------------------------------------------------------------------
