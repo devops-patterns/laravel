@@ -16,8 +16,13 @@ on:
         type: choice
         options: [checks, staging, production]
         default: checks
+      mode:
+        description: "production: deploy (вверх, БД не трогаем) / rollback (вниз, восстановить БД версии)"
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
       ref:
-        description: "Только для target=production: версия существующего образа (напр. v1.2.3)"
+        description: "Для target=production (обязателен): версия существующего образа, напр. v1.2.3"
         type: string
         required: false
 
@@ -32,58 +37,111 @@ permissions:
 
 jobs:
   # ── Проверки (всегда: PR, push, dispatch) ────────────────────────────────
+  # needs: [prepare] — не гоняем линт/тесты, если prepare упал (нет ref / запрет
+  # направления версии): fail-fast до затрат на проверки.
   lint:
+    needs: [prepare]
     uses: ./.github/workflows/lint.yml
     secrets: inherit
 
   test:
+    needs: [prepare]
     uses: ./.github/workflows/tests.yml
     secrets: inherit
 
-  # Готовит теги для production: на теге v* — из git-ref, при откате — из ref.
-  # Отдельным job, чтобы работать и когда build пропущен (откат существующего образа).
+  # Первым в графе (lint/test/build → needs: prepare). Готовит теги для production
+  # и жёстко гейтит НАПРАВЛЕНИЕ версии до затрат на проверки: deploy — только вверх,
+  # rollback — только вниз. Работает и когда build пропущен (раскат готового образа).
   prepare:
     runs-on: self-hosted
     outputs:
       prod_image_tag: ${{ steps.p.outputs.prod_image_tag }}
       prod_release_tag: ${{ steps.p.outputs.prod_release_tag }}
       rollback_to: ${{ steps.p.outputs.rollback_to }}
+      prod_deploy: ${{ steps.p.outputs.prod_deploy }}
+      direction: ${{ steps.p.outputs.direction }}
     steps:
       - id: p
         env:
           EVENT: ${{ github.event_name }}
           TARGET: ${{ inputs.target }}
+          MODE: ${{ inputs.mode }}
           REF_INPUT: ${{ inputs.ref }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          DIRECTION=""; ROLLBACK=""; PROD_DEPLOY=false
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "production" ]; then
             REL="$REF_INPUT"
             if [ -z "$REL" ]; then
-              echo "ERROR: для target=production нужен ref (версия существующего образа, напр. v1.2.3)" >&2
+              echo "ERROR: для target=production нужен ref (напр. v1.2.3)" >&2
               exit 1
             fi
+            PROD_DEPLOY=true
+            if [ "$MODE" = "rollback" ]; then
+              DIRECTION=rollback; ROLLBACK="$REL"   # rollback → восстановить БД версии
+            else
+              DIRECTION=deploy                       # deploy → БД не трогаем
+            fi
           elif [ "$REF_TYPE" = "tag" ]; then
-            REL="$REF_NAME"
+            REL="$REF_NAME"; PROD_DEPLOY=true; DIRECTION=deploy
           else
             REL=""
           fi
-          echo "prod_release_tag=$REL" >> "$GITHUB_OUTPUT"
-          echo "prod_image_tag=${REL#v}" >> "$GITHUB_OUTPUT"
-          # Откат = ручной dispatch на prod: восстановить БД под целевую версию.
-          # Обычный тег v* — пусто, БД не трогаем.
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "production" ]; then
-            echo "rollback_to=$REL" >> "$GITHUB_OUTPUT"
-          else
-            echo "rollback_to=" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo "prod_release_tag=$REL"
+            echo "prod_image_tag=${REL#v}"
+            echo "rollback_to=$ROLLBACK"
+            echo "prod_deploy=$PROD_DEPLOY"
+            echo "direction=$DIRECTION"
+          } >> "$GITHUB_OUTPUT"
+
+      # Жёсткий гейт направления: текущую версию знает только прод-хост → ssh.
+      # deploy только вверх (== ок, редеплой), rollback только строго вниз.
+      - name: Guard version direction
+        if: ${{ steps.p.outputs.prod_deploy == 'true' }}
+        uses: appleboy/ssh-action@v1
+        env:
+          NEW_VER: ${{ steps.p.outputs.prod_image_tag }}
+          DIRECTION: ${{ steps.p.outputs.direction }}
+        with:
+          host: ${{ vars.PROD_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          port: ${{ vars.SSH_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: NEW_VER,DIRECTION
+          script: |
+            set -euo pipefail
+            CUR_IMG=$(docker service inspect laravel_app \
+              --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || true)
+            CUR_IMG=${CUR_IMG%@*}; CUR_VER=${CUR_IMG##*:}
+            if ! printf '%s' "$CUR_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              if [ "$DIRECTION" = rollback ]; then
+                echo "ERROR: нет работающей semver-версии — откатывать не от чего" >&2
+                exit 1
+              fi
+              echo "первый деплой (текущая '$CUR_VER') — проверку направления пропускаю"
+              exit 0
+            fi
+            if [ "$DIRECTION" = rollback ]; then
+              if ! dpkg --compare-versions "$NEW_VER" lt "$CUR_VER"; then
+                echo "ERROR: rollback только на версию ниже текущей ($NEW_VER >= $CUR_VER). Вперёд — mode=deploy." >&2
+                exit 1
+              fi
+            else
+              if dpkg --compare-versions "$NEW_VER" lt "$CUR_VER"; then
+                echo "ERROR: понижение запрещено ($NEW_VER < $CUR_VER). Для отката — mode=rollback." >&2
+                exit 1
+              fi
+            fi
+            echo "direction ok: $DIRECTION $NEW_VER vs $CUR_VER"
 
   # ── Сборка образа ────────────────────────────────────────────────────────
   # Только после зелёных проверок. Пропускается на PR, на dispatch=checks и на
   # dispatch=production (откат катит уже собранный образ — пересборка не нужна).
   build:
-    needs: [lint, test]
+    needs: [prepare, lint, test]
     if: >-
       ${{ github.event_name != 'pull_request'
           && !(github.event_name == 'workflow_dispatch' && inputs.target == 'checks')

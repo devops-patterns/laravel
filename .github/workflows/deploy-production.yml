@@ -49,6 +49,7 @@ jobs:
         env:
           TAG: ${{ inputs.release_tag }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          ROLLBACK_TO: ${{ inputs.rollback_to }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_KEY: ${{ secrets.APP_KEY }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -62,7 +63,7 @@ jobs:
           username: ${{ vars.DEPLOY_USER }}
           port: ${{ vars.SSH_PORT }}
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: TAG,IMAGE_TAG,GH_TOKEN,APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL
+          envs: TAG,IMAGE_TAG,ROLLBACK_TO,GH_TOKEN,APP_KEY,DB_PASSWORD,REDIS_PASSWORD,APP_ENV,APP_DEBUG,APP_URL,LOG_LEVEL
           script: |
             set -euo pipefail
             cd /opt/stacks/laravel
@@ -158,8 +159,10 @@ jobs:
             # Помечаем снапшот УХОДЯЩЕЙ версией (тег работающего laravel_app) — при
             # откате на неё restore найдёт ровно этот архив. Скрипт gitops крутится
             # под root → sudo. Релиз не блокируем: cron borgmatic снимает по расписанию.
+            # На самом откате (ROLLBACK_TO задан) снапшот НЕ снимаем — уходящую БД всё
+            # равно затирает restore.
             DB_CID=$(db_container)
-            if [ -n "$DB_CID" ] && docker exec "$DB_CID" pg_isready -q 2>/dev/null; then
+            if [ -z "${ROLLBACK_TO:-}" ] && [ -n "$DB_CID" ] && docker exec "$DB_CID" pg_isready -q 2>/dev/null; then
               CUR_IMG=$(docker service inspect laravel_app \
                 --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || true)
               CUR_IMG=${CUR_IMG%@*}; CUR_VER=${CUR_IMG##*:}
@@ -218,7 +221,7 @@ jobs:
             echo "✓ Production deploy complete: $TAG (env ${ENV_VERSION}, image ${IMAGE})"
 
       # Откат: восстановить БД из точки отката целевой версии (rollback_to задан только
-      # при ручном dispatch target=production — обычный деплой по тегу v* БД не трогает).
+      # при dispatch target=production mode=rollback — deploy/тег БД не трогают).
       # Скрипт сам гасит app/queue/scheduler, чинит БД+медиа, возвращает реплики, мигрирует.
       - name: Restore database for rollback
         if: ${{ inputs.rollback_to != '' }}
