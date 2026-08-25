@@ -138,6 +138,23 @@ jobs:
               docker service ps laravel_db --no-trunc >&2
               return 1
             }
+            wait_redis_ready() {
+              # redis тоже раскатывается start-first — на время ротации таски
+              # DNS-имя "redis" в overlay-сети на пару секунд отваливается. Пробиваем
+              # redis:6379 ИЗ КОНТЕЙНЕРА APP (оттуда его дёргают artisan up/cache):
+              # fsockopen проверяет и резолв имени, и доступность TCP-порта разом.
+              local cid; cid=$(app_container)
+              [ -n "$cid" ] || { echo "ERROR: нет работающего laravel_app" >&2; return 1; }
+              for i in $(seq 1 60); do
+                if docker exec "$cid" php -r 'exit(@fsockopen("redis",6379,$e,$s,2)?0:1);' 2>/dev/null; then
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "ERROR: app не смог подключиться к redis:6379 за 120s" >&2
+              docker service ps laravel_redis --no-trunc >&2
+              return 1
+            }
             wait_service_running() {
               local svc="$1" img="$2"
               for i in $(seq 1 60); do
@@ -203,6 +220,11 @@ jobs:
 
             echo "→ Waiting for /up via Traefik"
             for i in $(seq 1 30); do probe_up && { echo "  /up ok"; break; }; sleep 2; done
+
+            # artisan up/cache цепляют redis — дождёмся резолва имени после раската
+            # (иначе getaddrinfo for redis failed роняет деплой на снятии maintenance).
+            echo "→ Waiting for laravel_redis to accept connections"
+            wait_redis_ready
 
             # Снять обслуживание (если включали) и подчистить кеш ПОСЛЕ up.
             CID=$(app_container)
