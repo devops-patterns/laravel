@@ -59,7 +59,8 @@ services:
         - "traefik.http.routers.laravel.entrypoints=websecure"
         - "traefik.http.routers.laravel.tls=true"
         - "traefik.http.routers.laravel.tls.certresolver=letsencrypt"
-        - "traefik.http.routers.laravel.middlewares=laravel-retry"
+        # staging-auth@file: basic-auth на staging, no-op на prod (задаёт gitops/traefik).
+        - "traefik.http.routers.laravel.middlewares=staging-auth@file,laravel-retry"
         - "traefik.http.middlewares.laravel-retry.retry.attempts=4"
         - "traefik.http.middlewares.laravel-retry.retry.initialInterval=50ms"
         - "traefik.http.services.laravel.loadbalancer.server.port=80"
